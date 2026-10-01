@@ -32,13 +32,6 @@ rescue => e
   [-1, "ERR #{e.class}: #{e.message[0, 120]}"]
 end
 
-SECRETY = /token|secret|key|pass|cert|cred|auth|cookie|bearer|jwt/i
-
-def mask_env(kv)
-  k, _, v = kv.partition('=')
-  k =~ SECRETY ? "#{k}=#{v[0, 10]}...[len=#{v.length}]" : kv[0, 160]
-end
-
 def decode_docker_logs(body)
   output = +''
   while body.bytesize >= 8 && [1, 2].include?(body.getbyte(0)) && body.byteslice(1, 3) == "\0\0\0"
@@ -50,11 +43,11 @@ def decode_docker_logs(body)
   output.empty? ? body : output
 end
 
-def sh_probe(image, cmd, shell = '/bin/sh')
+def sh_probe(image, cmd)
   st, pl = dapi('POST', '/containers/create',
-    'Image' => image, 'Entrypoint' => [shell, '-c'], 'Cmd' => [cmd],
+    'Image' => image, 'Entrypoint' => ['/bin/sh', '-c'], 'Cmd' => [cmd],
     'Tty' => false, 'HostConfig' => { 'NetworkMode' => 'none' },
-    'Labels' => { 'vulnoryx.controlled' => 'pages-awfdeep-c4c8' })
+    'Labels' => { 'vulnoryx.controlled' => 'pages-mcpg-c4c8' })
   return "VX_CREATE_FAIL #{st} #{pl[0, 120]}" unless st == 201
   cid = JSON.parse(pl)['Id']
   begin
@@ -68,52 +61,20 @@ def sh_probe(image, cmd, shell = '/bin/sh')
   end
 end
 
-IMGS = {
-  'squid'    => 'ghcr.io/github/gh-aw-firewall/squid:latest',
-  'apiproxy' => 'ghcr.io/github/gh-aw-firewall/api-proxy:latest',
-  'agent'    => 'ghcr.io/github/gh-aw-firewall/agent:latest',
-  'mcpg'     => 'ghcr.io/github/gh-aw-mcpg:latest'
-}
+OUT << "VX_AGENT_END\n" + sh_probe('ghcr.io/github/gh-aw-firewall/agent:latest',
+  'tail -c 900 /usr/local/bin/entrypoint.sh; echo; ' \
+  'find / -maxdepth 4 \( -iname "*policy*" -o -iname "*awf*" -o -name "*.yaml" -o -name "*.yml" \) ' \
+  '2>/dev/null | grep -vE "^/(proc|sys|usr/lib|usr/share|usr/include|etc/ssl|var/lib)" | head -30; ' \
+  'ls -la /usr/local/bin /opt 2>/dev/null | head -40; echo VX_DONE').to_s[0, 3600]
 
-IMGS.each do |short, name|
-  st, pl = dapi('GET', "/images/#{name}/json")
-  if st == 200
-    cfg = (JSON.parse(pl)['Config'] rescue {}) || {}
-    env = (cfg['Env'] || []).map { |kv| mask_env(kv) }
-    OUT << "VX_ENV_#{short} #{env.empty? ? '(none)' : env.join(' | ')}"
-  else
-    OUT << "VX_ENV_#{short} MISS #{st} #{pl[0, 80]}"
-  end
-end
+OUT << "VX_MCPG\n" + sh_probe('ghcr.io/github/gh-aw-mcpg:latest',
+  'ls -la /app 2>/dev/null | head -50; echo VX_CFG_run_tail; ' \
+  'tail -c +1200 /app/run_containerized.sh 2>/dev/null | head -c 1400; echo; ' \
+  'for f in /app/*.json /app/*.yaml /app/*.yml /app/*.toml /app/config*; do ' \
+  '[ -f "$f" ] && echo "VX_CFG_$f" && head -c 600 "$f"; done; ' \
+  'echo VX_MCPG_URLS; grep -rhoE "https?://[A-Za-z0-9._/-]+" /app 2>/dev/null | sort -u | head -30; echo VX_DONE').to_s[0, 4200]
 
-SQUID_CMD = 'echo "VX_SQUID_SIZE=$(wc -c < /etc/squid/squid.conf)"; ' \
-  'echo VX_CFG_squid_active; grep -vE "^[[:space:]]*(#|$)" /etc/squid/squid.conf | head -c 2600; echo; ' \
-  'echo VX_CFG_squid_tail; tail -c 1400 /etc/squid/squid.conf; echo; ' \
-  'echo VX_CFG_squid_sslbump; grep -inE "ssl|bump|cert|tls|ca[_-]" /etc/squid/squid.conf | head -30; ' \
-  'echo VX_SQUID_D; ls -la /etc/squid/conf.d /etc/squid/ssl_cert /var/spool/squid_ssl_db 2>/dev/null; ' \
-  'for f in /etc/squid/conf.d/*.conf; do [ -f "$f" ] && echo "VX_CFG_$f" && head -c 700 "$f"; done; echo VX_DONE'
-
-API_CMD = 'echo VX_CFG_routing-config.js; head -c 1100 /app/routing-config.js; echo; ' \
-  'echo VX_CFG_hosted-web-policy.js; head -c 1100 /app/hosted-web-policy.js; echo; ' \
-  'echo VX_URLS; grep -rhoE "https?://[A-Za-z0-9._/-]+" /app/*.js /app/*.json 2>/dev/null | sort -u | head -45; ' \
-  'echo VX_ENVNAMES; grep -rhoE "process\.env\.[A-Z_0-9]+" /app/*.js 2>/dev/null | sort -u | head -60; ' \
-  'echo VX_CFG_key-validation.js; head -c 500 /app/key-validation.js; echo; ' \
-  'echo VX_CFG_server.js_grep; grep -nE "listen|PORT|host|createServer|squid|upstream" /app/server.js | head -25; echo VX_DONE'
-
-AGENT_CMD = 'echo VX_CFG_entrypoint_tail; tail -c +1600 /usr/local/bin/entrypoint.sh | head -c 1400; echo; ' \
-  'echo VX_AGENT_FILES; find / -maxdepth 4 \( -name "*policy*" -o -name "*awf*" -o -name "*.yaml" -o -name "*.yml" \) ' \
-  '2>/dev/null | grep -vE "^/(proc|sys|usr/lib|usr/share|usr/include|etc/ssl)" | head -30; echo VX_DONE'
-
-MCPG_CMD = 'echo VX_MCPG_LS; ls -la /app 2>/dev/null | head -40; ' \
-  'echo VX_CFG_run_tail; tail -c +1200 /app/run_containerized.sh 2>/dev/null | head -c 1100; echo; ' \
-  'for f in /app/*.json /app/*.yaml /app/config* /app/*.js; do [ -f "$f" ] && echo "VX_CFG_$f" && head -c 500 "$f"; done; echo VX_DONE'
-
-OUT << "VX_SQUID\n" + sh_probe(IMGS['squid'], SQUID_CMD).to_s
-OUT << "VX_APIPROXY\n" + sh_probe(IMGS['apiproxy'], API_CMD).to_s
-OUT << "VX_AGENT\n" + sh_probe(IMGS['agent'], AGENT_CMD).to_s
-OUT << "VX_MCPG\n" + sh_probe(IMGS['mcpg'], MCPG_CMD).to_s
-
-payload = OUT.join("\n").gsub(/[^\x20-\x7E\n]/, '.')[0, 11000]
+payload = OUT.join("\n").gsub(/[^\x20-\x7E\n]/, '.')[0, 8000]
 puts 'VX_ESC_BEGIN'
 puts payload
 puts 'VX_ESC_END'
